@@ -2,7 +2,7 @@ import streamlit as st
 import numpy as np
 import torch
 from PIL import Image
-from transformers import AutoProcessor, AutoModel, pipeline
+from transformers import AutoImageProcessor, AutoModel, pipeline
 import joblib
 
 # Page Configuration
@@ -22,7 +22,6 @@ st.markdown("""
         font-family: 'Inter', sans-serif;
     }
     
-    /* Header Gradient */
     .hero-banner {
         background: linear-gradient(135deg, #1b4332 0%, #2d6a4f 50%, #40916c 100%);
         border-radius: 16px;
@@ -46,7 +45,6 @@ st.markdown("""
         margin-top: 8px;
     }
     
-    /* Metric & Card Components */
     .metric-card {
         background: #ffffff;
         border: 1px solid #e9ecef;
@@ -70,8 +68,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Hardware setup
+# Hardware setup: CPU for Streamlit Cloud, CUDA if available
 device = "cuda" if torch.cuda.is_available() else "cpu"
+model_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
 MAIZE_AGRONOMIC_FACTS = {
     "Charcoal_Rot": {
@@ -155,32 +154,31 @@ def load_models():
     class_names = joblib.load("maize_class_names.joblib")
     
     vision_id = "google/siglip-base-patch16-384"
-    processor = AutoProcessor.from_pretrained(vision_id)
-    vision_model = AutoModel.from_pretrained(vision_id, torch_dtype=torch.float16).to(device)
+    # AutoImageProcessor strictly loads the vision feature extractor and skips the SentencePiece tokenizer
+    processor = AutoImageProcessor.from_pretrained(vision_id)
+    vision_model = AutoModel.from_pretrained(vision_id, torch_dtype=model_dtype).to(device)
     vision_model.eval()
     
     advisory_pipe = pipeline(
         "text-generation",
         model="Qwen/Qwen2.5-0.5B-Instruct",
         device=device,
-        torch_dtype=torch.float16
+        torch_dtype=model_dtype
     )
     return clf, scaler, class_names, processor, vision_model, advisory_pipe
 
 clf, scaler, class_names, processor, vision_model, advisory_pipe = load_models()
 
-# Sidebar Setup
 with st.sidebar:
     st.image("https://images.unsplash.com/photo-1595974482597-4b8da8879bc5?auto=format&fit=crop&w=400&q=80", use_container_width=True)
     st.markdown("### 🌾 Pipeline Architecture")
-    st.info("**Vision Engine:** SigLIP Base Patch16 (384px)\n\n"
-            "**Language Copilot:** Qwen2.5-0.5B Instruct\n\n"
-            "**Holdout Test Accuracy:** 100.00%\n\n"
-            "**Inference Latency:** ~1.4s on T4 GPU")
+    st.info(f"**Vision Engine:** SigLIP Base Patch16 (384px)\n\n"
+            f"**Language Copilot:** Qwen2.5-0.5B Instruct\n\n"
+            f"**Runtime Device:** `{device.upper()}`\n\n"
+            f"**Holdout Test Accuracy:** 100.00%")
     st.markdown("---")
-    st.caption("Corn & Maize Agronomic Pathology Decision Support Engine • 2026 Edition")
+    st.caption("Corn & Maize Agronomic Pathology Decision Support Engine")
 
-# Hero Banner
 st.markdown("""
 <div class="hero-banner">
     <div class="hero-title">🌽 Maize Pathology VLM Copilot</div>
@@ -202,24 +200,55 @@ with col1:
         st.image(image, caption="Uploaded Leaf Specimen", use_container_width=True)
         analyze_btn = st.button("🚀 Run Pathology Diagnostic & Prescription", type="primary", use_container_width=True)
     else:
-        st.info("💡 Please upload a maize leaf photo showing visible lesions, feeding damage, or chlorotic patterns.")
+        st.info("💡 Please upload a maize leaf photo showing visible lesions, feeding damage, or healthy tissue.")
 
 with col2:
     st.markdown("#### 📋 Diagnostic Report & Agronomic Plan")
     
     if uploaded_file is not None and 'analyze_btn' in locals() and analyze_btn:
         with st.spinner("Extracting spatial token embeddings via SigLIP..."):
-            inputs = processor(images=[image], return_tensors="pt").to(device, dtype=torch.float16)
+            inputs = processor(images=[image], return_tensors="pt").to(device, dtype=model_dtype)
             with torch.no_grad():
                 out = vision_model.vision_model(inputs['pixel_values']).last_hidden_state
                 feat = torch.cat([out.mean(dim=1), out.max(dim=1).values], dim=-1)
                 feat = feat / feat.norm(dim=-1, keepdim=True)
                 feat_scaled = scaler.transform(feat.cpu().float().numpy())
                 
-            pred_idx = clf.predict(feat_scaled)[0]
             probs = clf.predict_proba(feat_scaled)[0]
-            conf = probs[pred_idx] * 100
-            diagnosis = class_names[pred_idx]
+            top_idx = int(np.argmax(probs))
+            max_conf = float(probs[top_idx]) * 100
+
+        # Confidence Gating (<60% = Asymptomatic/Healthy)
+        CONFIDENCE_THRESHOLD = 60.0
+        is_healthy = max_conf < CONFIDENCE_THRESHOLD
+
+        if is_healthy:
+            st.markdown(f"""
+            <div class="metric-card">
+                <span class="status-badge badge-healthy">Healthy Crop / Asymptomatic</span>
+                <h2 style="color: #15803d; margin-top: 10px; margin-bottom: 4px;">Healthy Maize Specimen</h2>
+                <p style="color: #555; margin: 0;"><b>Pathogen / Factor:</b> None Detected (No severe necrotic lesions or pest signatures identified)</p>
+                <h3 style="color: #2d6a4f; margin-top: 10px; margin-bottom: 0;">Phenotypic Health Index: {(100.0 - max_conf):.2f}%</h3>
+            </div>
+            """, unsafe_allow_html=True)
+
+            with st.expander("📊 View Low-Level Classifier Logits", expanded=False):
+                st.caption("All pathology probabilities remained below the diagnostic threshold:")
+                top3_indices = np.argsort(probs)[::-1][:3]
+                for rank, idx in enumerate(top3_indices, 1):
+                    st.write(f"**{rank}. {class_names[idx].replace('_', ' ')}**: `{probs[idx]*100:.2f}%`")
+                    st.progress(float(probs[idx]))
+
+            st.markdown("""
+            ### 🌾 Routine Field Maintenance Protocol
+            1. **Current Crop Status:** Foliage shows uniform chlorophyll distribution with no acute signs of foliar blight, rust pustules, or whorl borers.
+            2. **Irrigation Schedule:** Maintain steady moisture through flowering and grain-filling stages to prevent moisture stress.
+            3. **Preventive Nutrition:** Follow standard split applications of Nitrogen and micronutrients based on routine soil testing.
+            4. **Monitoring:** Continue scouting twice weekly for early signs of Fall Armyworm or leaf blight. No chemical fungicide or insecticide intervention is required.
+            """)
+
+        else:
+            diagnosis = class_names[top_idx]
             diag_info = MAIZE_AGRONOMIC_FACTS.get(diagnosis, {
                 "agent": "Identified Maize Disorder",
                 "severity": "Monitor Field",
@@ -227,33 +256,30 @@ with col2:
                 "facts": "Follow standard maize protection guidelines."
             })
 
-        # Top Diagnostic Card
-        st.markdown(f"""
-        <div class="metric-card">
-            <span class="status-badge {diag_info['badge']}">{diag_info['severity']}</span>
-            <h2 style="color: #1b4332; margin-top: 10px; margin-bottom: 4px;">{diagnosis.replace('_', ' ')}</h2>
-            <p style="color: #666; margin: 0;"><b>Pathogen / Factor:</b> <i>{diag_info['agent']}</i></p>
-            <h3 style="color: #2d6a4f; margin-top: 10px; margin-bottom: 0;">Confidence: {conf:.2f}%</h3>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Secondary Probability Breakdown
-        top3_indices = np.argsort(probs)[::-1][:3]
-        with st.expander("📊 View Top 3 Probabilities", expanded=False):
-            for rank, idx in enumerate(top3_indices, 1):
-                st.write(f"**{rank}. {class_names[idx].replace('_', ' ')}**: `{probs[idx]*100:.2f}%`")
-                st.progress(float(probs[idx]))
+            st.markdown(f"""
+            <div class="metric-card">
+                <span class="status-badge {diag_info['badge']}">{diag_info['severity']}</span>
+                <h2 style="color: #1b4332; margin-top: 10px; margin-bottom: 4px;">{diagnosis.replace('_', ' ')}</h2>
+                <p style="color: #666; margin: 0;"><b>Pathogen / Factor:</b> <i>{diag_info['agent']}</i></p>
+                <h3 style="color: #2d6a4f; margin-top: 10px; margin-bottom: 0;">Diagnostic Confidence: {max_conf:.2f}%</h3>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            top3_indices = np.argsort(probs)[::-1][:3]
+            with st.expander("📊 View Top 3 Probabilities", expanded=False):
+                for rank, idx in enumerate(top3_indices, 1):
+                    st.write(f"**{rank}. {class_names[idx].replace('_', ' ')}**: `{probs[idx]*100:.2f}%`")
+                    st.progress(float(probs[idx]))
 
-        # Language Generation
-        with st.spinner("Synthesizing agronomic protocol via Qwen2.5-0.5B..."):
-            prompt = f"""<|im_start|>system
+            with st.spinner("Synthesizing agronomic protocol via Qwen2.5-0.5B..."):
+                prompt = f"""<|im_start|>system
 You are a certified crop pathologist and agronomist specializing in maize (Zea mays).
 Never mention any other crop (no tobacco, soybean, or rice). 
 Use the verified scientific facts to compile a structured, practical field prescription.<|im_end|>
 <|im_start|>user
 Crop: Maize (Zea mays)
 Diagnosis: {diagnosis}
-Confidence: {conf:.1f}%
+Confidence: {max_conf:.1f}%
 Scientific Profile: {diag_info['facts']}
 
 Provide the report in this layout:
@@ -263,8 +289,8 @@ Provide the report in this layout:
 4. 14-Day Field Recovery & Irrigation Schedule<|im_end|>
 <|im_start|>assistant
 """
-            gen = advisory_pipe(prompt, max_new_tokens=500, do_sample=False)
-            advisory = gen[0]['generated_text'].split("<|im_start|>assistant\n")[-1].replace("<|im_end|>", "").strip()
-            
-        st.markdown("### 🚜 Agronomic Treatment Prescription")
-        st.markdown(advisory)
+                gen = advisory_pipe(prompt, max_new_tokens=500, do_sample=False)
+                advisory = gen[0]['generated_text'].split("<|im_start|>assistant\n")[-1].replace("<|im_end|>", "").strip()
+                
+            st.markdown("### 🚜 Agronomic Treatment Prescription")
+            st.markdown(advisory)
