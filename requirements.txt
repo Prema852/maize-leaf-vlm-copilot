@@ -5,3 +5,5 @@ scikit-learn
 pillow
 joblib
 accelerate
+sentencepiece
+protobuf
