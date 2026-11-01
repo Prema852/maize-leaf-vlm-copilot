@@ -86,20 +86,45 @@ SCOPES = [
 ]
 
 
-@st.cache_resource
 def get_google_services():
-  """Initializes Google Drive and Sheets clients using Streamlit Secrets."""
+  """Initializes Google Drive and Sheets clients using Streamlit Secrets with error alerts."""
   try:
+    if "gcp_service_account" not in st.secrets:
+      st.error(
+          "❌ Streamlit Secret '[gcp_service_account]' was not found in App"
+          " Settings > Secrets!"
+      )
+      return None, None
+
+    if "drive_config" not in st.secrets:
+      st.error(
+          "❌ Streamlit Secret '[drive_config]' was not found in App Settings >"
+          " Secrets!"
+      )
+      return None, None
+
     creds_dict = dict(st.secrets["gcp_service_account"])
+
+    # Ensure literal escaped newlines in private key string parse properly
+    if "\\n" in creds_dict.get("private_key", ""):
+      creds_dict["private_key"] = creds_dict["private_key"].replace(
+          "\\n", "\n"
+      )
+
     credentials = service_account.Credentials.from_service_account_info(
         creds_dict, scopes=SCOPES
     )
+
     drive_service = build("drive", "v3", credentials=credentials)
     gc_client = gspread.authorize(credentials)
-    sheet = gc_client.open_by_key(st.secrets["drive_config"]["sheet_id"]).sheet1
+
+    sheet_id = st.secrets["drive_config"]["sheet_id"]
+    sheet = gc_client.open_by_key(sheet_id).sheet1
+
     return drive_service, sheet
+
   except Exception as e:
-    print(f"Service initialization error: {e}")
+    st.error(f"❌ Google Service Connection Error: {e}")
     return None, None
 
 
@@ -110,7 +135,7 @@ def log_user_diagnosis(
     confidence_score,
     severity="Normal",
 ):
-  """Silently logs leaf photo to Google Drive and diagnostic metadata to Google Sheets."""
+  """Uploads leaf photo to Drive and logs metadata to Sheets with explicit feedback."""
   try:
     drive_service, sheet = get_google_services()
     if not drive_service or not sheet:
@@ -121,20 +146,21 @@ def log_user_diagnosis(
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
     cloud_filename = f"{now.strftime('%Y%m%d_%H%M%S')}_{original_filename}"
 
-    # Upload leaf image to Google Drive
+    # 1. Upload leaf image to Google Drive
     media = MediaIoBaseUpload(
         io.BytesIO(image_bytes), mimetype="image/jpeg", resumable=False
     )
     file_metadata = {"name": cloud_filename, "parents": [folder_id]}
-    uploaded_file = (
+
+    uploaded_file_res = (
         drive_service.files()
         .create(body=file_metadata, media_body=media, fields="id")
         .execute()
     )
-    file_id = uploaded_file.get("id")
+    file_id = uploaded_file_res.get("id")
     drive_file_url = f"https://drive.google.com/file/d/{file_id}/view"
 
-    # Append diagnostic row to Google Sheets
+    # 2. Append row to Google Sheets
     row_data = [
         timestamp_str,
         cloud_filename,
@@ -144,8 +170,11 @@ def log_user_diagnosis(
         severity,
     ]
     sheet.append_row(row_data)
+
+    st.toast("✅ Cloud Logging Complete: Saved to Drive & Google Sheets!")
+
   except Exception as e:
-    print(f"Cloud logging notice: {e}")
+    st.error(f"❌ Cloud Upload / Logging Error: {e}")
 
 
 MAIZE_AGRONOMIC_PROTOCOLS = {
@@ -459,7 +488,7 @@ clf, scaler, class_names, processor, vision_model = load_vision_pipeline()
 with st.sidebar:
   st.image(
       "https://images.unsplash.com/photo-1595974482597-4b8da8879bc5?auto=format&fit=crop&w=400&q=80",
-      use_container_width=True,
+      width="stretch",
   )
   st.markdown("### 🌾 Pipeline Architecture")
   st.info(
@@ -492,11 +521,11 @@ with col1:
 
   if uploaded_file is not None:
     image = Image.open(uploaded_file).convert("RGB")
-    st.image(image, caption="Uploaded Leaf Specimen", use_container_width=True)
+    st.image(image, caption="Uploaded Leaf Specimen", width="stretch")
     analyze_btn = st.button(
         "🚀 Run Pathology Diagnostic & Prescription",
         type="primary",
-        use_container_width=True,
+        width="stretch",
     )
   else:
     st.info(
@@ -624,7 +653,7 @@ with col2:
 - **Field Plan:** {diag_info['schedule']}
             """)
 
-    # Background Cloud Logging (Drive Image + Sheets Metadata)
+    # Background Cloud Logging
     log_user_diagnosis(
         image_bytes=uploaded_file.getvalue(),
         original_filename=uploaded_file.name,
