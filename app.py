@@ -60,17 +60,23 @@ def get_google_sheet():
 
         credentials = service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
         gc_client = gspread.authorize(credentials)
-        sheet = gc_client.open_by_key(st.secrets["drive_config"]["sheet_id"]).sheet1
+        sheet_id = st.secrets["drive_config"]["sheet_id"]
+        sheet = gc_client.open_by_key(sheet_id).sheet1
         return sheet
     except Exception as e:
         st.error(f"❌ Google Sheets Connection Failed: {repr(e)}")
         return None
 
-# --- Image Cloud Storage (ImgBB) ---
+# --- Resilient ImgBB Image Cloud Storage ---
 def upload_image_to_cloud(image_bytes, filename):
-    api_key = st.secrets.get("IMGBB_API_KEY", "")
+    # Dynamically resolve key regardless of root-level or nested [drive_config] placement
+    api_key = st.secrets.get("IMGBB_API_KEY")
+    if not api_key and "drive_config" in st.secrets:
+        api_key = st.secrets["drive_config"].get("IMGBB_API_KEY")
+
     if not api_key:
         return "API Key Missing"
+
     try:
         url = "https://api.imgbb.com/1/upload"
         payload = {
@@ -78,11 +84,12 @@ def upload_image_to_cloud(image_bytes, filename):
             "name": filename,
             "image": base64.b64encode(image_bytes).decode("utf-8")
         }
-        res = requests.post(url, data=payload, timeout=20)
+        res = requests.post(url, data=payload, timeout=25)
         data = res.json()
         if data.get("status") == 200:
             return data["data"]["url"]
-        return "Upload Error"
+        err_msg = data.get("error", {}).get("message", "Upload Failed")
+        return f"Upload Error: {err_msg}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -239,11 +246,11 @@ if uploaded_files:
                 prescription = diag_meta["chemical"]
                 badge = diag_meta["badge"]
 
-            # Upload Image to Cloud
+            # Persistent ImgBB Cloud Storage
             now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             cloud_url = upload_image_to_cloud(image_bytes, file.name)
 
-            # Append to sheet records
+            # Append structured row for Google Sheet
             rows_for_sheet.append([
                 now_str,
                 file.name,
@@ -266,7 +273,7 @@ if uploaded_files:
 
             progress_bar.progress((idx + 1) / len(uploaded_files))
 
-        # Append rows into Google Sheets
+        # Append all records to Google Sheets
         if sheet and rows_for_sheet:
             try:
                 sheet.append_rows(rows_for_sheet)
