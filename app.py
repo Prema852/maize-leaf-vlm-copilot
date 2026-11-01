@@ -1,6 +1,7 @@
 import datetime
 import gc
 import io
+import traceback
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -87,7 +88,7 @@ SCOPES = [
 
 
 def get_google_services():
-  """Initializes Google Drive and Sheets clients using Streamlit Secrets with error alerts."""
+  """Initializes Google Drive and Sheets clients using Streamlit Secrets with key normalization."""
   try:
     if "gcp_service_account" not in st.secrets:
       st.error(
@@ -105,11 +106,11 @@ def get_google_services():
 
     creds_dict = dict(st.secrets["gcp_service_account"])
 
-    # Ensure literal escaped newlines in private key string parse properly
-    if "\\n" in creds_dict.get("private_key", ""):
-      creds_dict["private_key"] = creds_dict["private_key"].replace(
-          "\\n", "\n"
-      )
+    # Robust handling for private key formatting (handles both literal \n and real linebreaks)
+    raw_key = creds_dict.get("private_key", "")
+    if "\\n" in raw_key:
+      creds_dict["private_key"] = raw_key.replace("\\n", "\n")
+    creds_dict["private_key"] = creds_dict["private_key"].strip()
 
     credentials = service_account.Credentials.from_service_account_info(
         creds_dict, scopes=SCOPES
@@ -124,7 +125,8 @@ def get_google_services():
     return drive_service, sheet
 
   except Exception as e:
-    st.error(f"❌ Google Service Connection Error: {e}")
+    st.error(f"❌ Google Connection Failed ({type(e).__name__}): {repr(e)}")
+    st.code(traceback.format_exc(), language="text")
     return None, None
 
 
@@ -135,7 +137,7 @@ def log_user_diagnosis(
     confidence_score,
     severity="Normal",
 ):
-  """Uploads leaf photo to Drive and logs metadata to Sheets with explicit feedback."""
+  """Uploads leaf photo to Drive and logs metadata to Sheets with explicit on-screen feedback."""
   try:
     drive_service, sheet = get_google_services()
     if not drive_service or not sheet:
