@@ -4,7 +4,10 @@ transformers
 scikit-learn
 pillow
 joblib
-google-api-python-client
-google-auth
-google-auth-httplib2
+numpy
+pandas
+requests
 gspread
+google-auth
+google-api-python-client
+google-auth-httplib2
