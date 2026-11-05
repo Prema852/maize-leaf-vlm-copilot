@@ -11,9 +11,12 @@ import pandas as pd
 from PIL import Image
 import streamlit as st
 import torch
-from transformers import AutoImageProcessor, AutoModel
+from transformers import AutoImageProcessor, SiglipVisionModel
 
-# --- Page Configuration ---
+# Force PyTorch single-threading to eliminate CPU core thread-allocation memory spikes on Streamlit Cloud
+torch.set_num_threads(1)
+
+# --- Streamlit Page Configuration ---
 st.set_page_config(
     page_title="CeraVLM | Maize Pathology Copilot",
     page_icon="🌽",
@@ -30,7 +33,6 @@ st.markdown("""
         font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
     }
     
-    /* Hero Section */
     .hero-container {
         background: linear-gradient(135deg, #0f3d2e 0%, #1b5e20 45%, #2e7d32 100%);
         border-radius: 18px;
@@ -71,7 +73,6 @@ st.markdown("""
         border: 1px solid rgba(255, 255, 255, 0.2);
     }
     
-    /* Metric Cards */
     .metric-box {
         background: #ffffff;
         border: 1px solid #e2e8f0;
@@ -97,7 +98,6 @@ st.markdown("""
         letter-spacing: 0.04em;
     }
 
-    /* Diagnosis Specimen Card */
     .specimen-card {
         background: #ffffff;
         border-radius: 16px;
@@ -113,7 +113,6 @@ st.markdown("""
         border-color: #cbd5e1;
     }
 
-    /* Severity Badges */
     .badge-critical {
         background: #fee2e2;
         color: #991b1b;
@@ -145,7 +144,6 @@ st.markdown("""
         letter-spacing: 0.02em;
     }
 
-    /* Prescription Pill Container */
     .rx-box {
         background: #f8fafc;
         border-left: 4px solid #16a34a;
@@ -168,7 +166,6 @@ st.markdown("""
         margin: 0;
     }
 
-    /* Links */
     .cloud-link {
         font-size: 0.84rem;
         color: #2563eb;
@@ -182,6 +179,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Fixed to CPU on Streamlit Cloud to avoid driver/CUDA memory overhead
 device = "cuda" if torch.cuda.is_available() else "cpu"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -197,8 +195,10 @@ with st.sidebar:
     plot_id = st.text_input("Plot / Farm Identifier", value="Zone A - Block 4")
     notes = st.text_area("Field Notes (Optional)", placeholder="E.g., High humidity post-monsoon rain")
 
-# --- Google Sheets Authorization ---
+# --- Google Sheets Authorization (Resilient & Non-Crashing) ---
 def get_google_sheet():
+    if "gcp_service_account" not in st.secrets or "drive_config" not in st.secrets:
+        return None
     try:
         creds_dict = dict(st.secrets["gcp_service_account"])
         raw_key = creds_dict.get("private_key", "")
@@ -211,7 +211,7 @@ def get_google_sheet():
         sheet_id = st.secrets["drive_config"]["sheet_id"]
         return gc_client.open_by_key(sheet_id).sheet1
     except Exception as e:
-        st.error(f"❌ Google Sheets Connection Failed: {repr(e)}")
+        st.warning(f"⚠️ Google Sheets Sync Disabled: {e}")
         return None
 
 # --- Resilient Cloud Storage (ImgBB) ---
@@ -221,7 +221,7 @@ def upload_image_to_cloud(image_bytes, filename):
         api_key = st.secrets["drive_config"].get("IMGBB_API_KEY")
 
     if not api_key:
-        return "API Key Missing"
+        return "Image persistence skipped (API key not configured)"
 
     try:
         url = "https://api.imgbb.com/1/upload"
@@ -230,7 +230,7 @@ def upload_image_to_cloud(image_bytes, filename):
             "name": filename,
             "image": base64.b64encode(image_bytes).decode("utf-8")
         }
-        res = requests.post(url, data=payload, timeout=25)
+        res = requests.post(url, data=payload, timeout=15)
         data = res.json()
         if data.get("status") == 200:
             return data["data"]["url"]
@@ -314,18 +314,23 @@ MAIZE_AGRONOMIC_PROTOCOLS = {
     }
 }
 
-# --- Cache Model Pipeline ---
-@st.cache_resource
+# --- Cache Model Pipeline (Locked to 1 Instance, Zero Multi-Reload Leak) ---
+@st.cache_resource(max_entries=1)
 def load_vision_pipeline():
     clf = joblib.load("maize_vlm_classifier.joblib")
     scaler = joblib.load("maize_vlm_scaler.joblib")
     class_names = joblib.load("maize_class_names.joblib")
     vision_id = "google/siglip-base-patch16-384"
     processor = AutoImageProcessor.from_pretrained(vision_id)
-    vision_model = AutoModel.from_pretrained(
-        vision_id, torch_dtype=torch.float32, low_cpu_mem_usage=True
+    
+    # Standalone SiglipVisionModel excludes text tower, saving >450 MB RAM
+    vision_model = SiglipVisionModel.from_pretrained(
+        vision_id, 
+        torch_dtype=torch.float32, 
+        low_cpu_mem_usage=True
     ).to(device)
     vision_model.eval()
+    
     gc.collect()
     return clf, scaler, class_names, processor, vision_model
 
@@ -371,12 +376,15 @@ if uploaded_files:
         for idx, file in enumerate(uploaded_files):
             status_text.markdown(f"**Analyzing specimen {idx+1}/{len(uploaded_files)}:** `{file.name}`...")
             image_bytes = file.getvalue()
-            image = Image.open(file).convert("RGB")
+            
+            # Open and downsample high-res phone uploads to avoid memory spikes before tokenizing
+            raw_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            raw_img.thumbnail((768, 768), Image.Resampling.LANCZOS)
 
-            # Vision Feature Extraction
-            inputs = processor(images=[image], return_tensors="pt").to(device, dtype=torch.float32)
+            # Vision Feature Extraction using standalone vision tower
+            inputs = processor(images=[raw_img], return_tensors="pt").to(device, dtype=torch.float32)
             with torch.no_grad():
-                out = vision_model.vision_model(inputs["pixel_values"]).last_hidden_state
+                out = vision_model(inputs["pixel_values"]).last_hidden_state
                 feat = torch.cat([out.mean(dim=1), out.max(dim=1).values], dim=-1)
                 feat = feat / feat.norm(dim=-1, keepdim=True)
                 feat_scaled = scaler.transform(feat.cpu().float().numpy())
@@ -419,6 +427,10 @@ if uploaded_files:
                 plot_id
             ])
 
+            # Downsample thumbnail for lightweight UI display
+            display_thumb = raw_img.copy()
+            display_thumb.thumbnail((400, 400))
+
             results_data.append({
                 "Image Name": file.name,
                 "Diagnosis": diagnosis_title,
@@ -429,8 +441,12 @@ if uploaded_files:
                 "Recommended Prescription": prescription,
                 "Image URL": cloud_url,
                 "Badge": badge,
-                "PIL Image": image
+                "PIL Image": display_thumb
             })
+
+            # Explicit memory reclamation on every step
+            del inputs, out, feat, feat_scaled, raw_img
+            gc.collect()
 
             progress_bar.progress((idx + 1) / len(uploaded_files))
 
